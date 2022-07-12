@@ -1115,9 +1115,8 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
 
     def transcribe(self, model, text_direction=None):
         trans, created = Transcription.objects.get_or_create(
-            name="kraken:" + model.name, document=self.document
+            name=f"{model.engine}:{model.name}", document=self.document
         )
-        model_ = kraken_models.load_any(model.file.path)
 
         lines = self.lines.all()
         text_direction = (
@@ -1133,13 +1132,24 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
         else:
             reorder = 'L'
 
+        {"kraken": self.transcribe_kraken,
+         "tesseract": self.transcribe_tesseract}[model.engine](model, lines, trans, text_direction, reorder)
+
+        self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
+        self.calculate_progress()
+        self.save()
+
+    def transcribe_kraken(self, model, lines, trans, text_direction, reorder):
+        model_ = kraken_models.load_any(model.file.path)
         with Image.open(self.image.file.name) as im:
             for line in lines:
                 if not line.baseline:
                     bounds = {
                         "boxes": [line.box],
                         "text_direction": text_direction,
-                        "type": "baselines",
+                        "baseline": line.baseline,
+                        "mask": line.mask,
+                        "type": "bounding_box",
                         # 'script_detection': True
                     }
                 else:
@@ -1156,15 +1166,15 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
                         # 'selfcript_detection': True
                     }
 
+                lt, created = LineTranscription.objects.get_or_create(
+                    line=line, transcription=trans)
+
                 it = rpred.rpred(
                     model_,
                     im,
                     bounds=bounds,
                     pad=16,  # TODO: % of the image?
                     bidi_reordering=reorder
-                )
-                lt, created = LineTranscription.objects.get_or_create(
-                    line=line, transcription=trans
                 )
                 for pred in it:
                     lt.content = pred.prediction
@@ -1176,9 +1186,43 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
                         pred.prediction, pred.cuts, pred.confidences)]
                 lt.save()
 
-        self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
-        self.calculate_progress()
-        self.save()
+    def transcribe_tesseract(self, model, lines, trans, text_direction, reorder):
+        from tesserocr import PyTessBaseAPI, RIL, iterate_level
+        from shapely.affinity import scale, translate, rotate, interpret_origin
+        from shapely.geometry import Polygon, Point, LineString, MultiPoint
+        from shapely.ops import split, nearest_points
+        model_ = model.file.path
+        with Image.open(self.image.file.name) as im:
+            with PyTessBaseAPI(path=os.path.dirname(model.file.path),
+                               lang=os.path.basename(model.file.path).rsplit('.', 1)[0],
+                               psm=13) as api:
+
+                for line in lines:
+                    bounds = {
+                        "baseline": line.baseline,
+                        "mask": line.mask,
+                        "type": "bounding_box",
+                        # 'script_detection': True
+                        }
+                    lt, created = LineTranscription.objects.get_or_create(
+                        line=line, transcription=trans)
+
+                    cutout = im.crop(line.box)
+                    api.SetImage(cutout)
+                    api.Recognize()
+                    ri = api.GetIterator()
+                    graph = list()
+                    content = ""
+                    for symbol_idx, symbol in enumerate(iterate_level(ri, RIL.SYMBOL)):
+                        if symbol.IsAtBeginningOf(RIL.WORD) and content != "":
+                            content += " "
+                        content += symbol.GetUTF8Text(RIL.SYMBOL)
+                        graph.append({'c': symbol.GetUTF8Text(RIL.SYMBOL),
+                                      'poly': symbol.BoundingBoxInternal(RIL.SYMBOL),
+                                      'confidence': float(symbol.Confidence(RIL.SYMBOL)) / 100})
+                    lt.content = content
+                    lt.graph = graph
+                    lt.save()
 
     def chain_tasks(self, *tasks):
         redis_.set(
@@ -1206,7 +1250,7 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
                                      report_label='Binarize in %s' % self.document.name,
                                      **kwargs))
 
-        if (task_name == 'segment'):
+        if task_name == 'segment':
             tasks.append(segment.si(instance_pk=self.pk,
                                     report_label='Segment in %s' % self.document.name,
                                     **kwargs))
@@ -1658,7 +1702,7 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
     file = models.FileField(
         upload_to=models_path,
         null=True,
-        validators=[FileExtensionValidator(allowed_extensions=["mlmodel"])],
+        validators=[FileExtensionValidator(allowed_extensions=["mlmodel", "traineddata"])],
     )
     file_size = models.BigIntegerField()
 
@@ -1702,6 +1746,11 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
         return self.name
 
     @cached_property
+    def engine(self):
+        return {'mlmodel': 'kraken',
+                'traineddata': 'tesseract'}.get(self.file.name.rsplit('.', 1)[-1])
+
+    @cached_property
     def accuracy_percent(self):
         return self.training_accuracy * 100
 
@@ -1709,7 +1758,7 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
         children_count = OcrModel.objects.filter(parent=self).count() + 2
         model = OcrModel.objects.create(
             owner=self.owner or owner,
-            name=name or self.name.split(".mlmodel")[0] + f"_v{children_count}",
+            name=name or self.name.split(".")[0] + f"_v{children_count}",
             job=self.job,
             public=False,
             script=self.script,

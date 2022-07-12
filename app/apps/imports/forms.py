@@ -128,6 +128,7 @@ class ImportForm(BootstrapFormMixin, forms.Form):
         return self.instance
 
     def process(self):
+        #self.clean()
         document_import.delay(
             import_pk=self.instance.pk,
             user_pk=self.user.pk,
