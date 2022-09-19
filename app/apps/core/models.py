@@ -1133,7 +1133,7 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
             reorder = 'L'
 
         {"kraken": self.transcribe_kraken,
-         "tesseract": self.transcribe_tesseract}[model.engine](model, lines, trans, text_direction, reorder)
+         "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, trans, text_direction, reorder)
 
         self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
         self.calculate_progress()
@@ -1196,8 +1196,7 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
             with PyTessBaseAPI(path=os.path.dirname(model.file.path),
                                lang=os.path.basename(model.file.path).rsplit('.', 1)[0],
                                psm=13) as api:
-
-                for line in lines:
+                for idx, line in enumerate(lines):
                     bounds = {
                         "baseline": line.baseline,
                         "mask": line.mask,
