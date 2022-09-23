@@ -465,24 +465,51 @@ def train_kraken(qs, document, transcription, model=None, user=None):
     else:
         raise ValueError('No model created.')
 
+
+def crop_image(image, mask, polygon=True, smooth=True, background='dominant'):
+    """ Crop polygon or bounding box from image """
+    from shapely.geometry import Polygon
+    from PIL import Image, ImageDraw, ImageFilter
+    bbox = Polygon(mask).bounds
+    cutout = image.crop(mask)
+    if polygon:
+        # Background
+        if background == 'white':
+            bg = Image.new("L", cutout.size, 255)
+        else:
+            # Get dominant color
+            img = cutout.copy()
+            img = img.convert(cutout.mode)
+            img = img.resize((1, 1), resample=0)
+            dominant_color = img.getpixel((0, 0))
+            bg = Image.new(cutout.mode, cutout.size, dominant_color)
+        mask = Image.new("L", cutout.size, 255)
+        # Mask text region
+        draw = ImageDraw.Draw(mask)
+        draw.polygon([(point[0] - bbox[0], point[1] - bbox[1]) for point in lt['mask']], 0, 1)
+        if smooth:
+            mask = mask.filter(ImageFilter.GaussianBlur(3))
+        # Combine bg and cutout
+        cutout.paste(bg, (0, 0), mask)
+    return cutout
+
 def train_tesseract(qs, document, transcription, model=None, user=None, expert_settings=None):
     # # Note hack to circumvent AssertionError: daemonic processes are not allowed to have children
     from collections import Counter, namedtuple
     from multiprocessing import current_process
     from hashlib import sha256
     import fcntl
-    from datetime import datetime, date
+    from datetime import date
     from pathlib import Path
     import subprocess
     import shlex
     import time
     import pickle
 
-    from PIL import Image, ImageDraw, ImageFilter
+    from PIL import Image
     from tesserocr import PyTessBaseAPI
     from bs4 import BeautifulSoup
     from urllib.request import urlopen
-    from shapely.geometry import Polygon
 
     def clean_old_ground_truth(gt_path, expiration_timedelta_days=7):
         # Clean the files if they are X (default: 7) days and not used or a half year (locking files is not perfect)
@@ -505,30 +532,12 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
             locked_file.close()
         return
 
-    def update_meta(filepath, job_end=False):
-        count = -1 if job_end else 1
-        if filepath.exists():
-            with filepath.open('r', encoding='utf-8') as meta:
-                metadata = json.load(meta)
-            metadata['Processed_by'] += count
-            if count == 1:
-                metadata['Used_at'] = datetime.now().isoformat()
-            with filepath.open('w', encoding='utf-8') as meta:
-                json.dump(metadata, meta, ensure_ascii=False, indent=4)
-            return True
-        else:
-            with filepath.open('w', encoding='utf-8') as meta:
-                json.dump({'Created_at': datetime.now().isoformat(),
-                           'Used_at': datetime.now().isoformat(),
-                           'Processed_by': 1}, meta, ensure_ascii=False, indent=4)
-            return False
-
     # Placeholder for up comming "Expert Settings"
     if expert_settings is None:
         expert_settings = namedtuple('Expert_Settings', 'mask_polygon')
-        expert_settings.mask_polygon = False #True
-        expert_settings.mask_smoothing = True
-        expert_settings.mask_coloring = 'dominant'
+        expert_settings.crop_polygon = True
+        expert_settings.crop_smoothing = True
+        expert_settings.crop_background = 'dominant'
 
     # Currently just checking if the model is trainable (best model)
     # TODO: Convert model from fast to best instead and than train with that
@@ -542,7 +551,6 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
                 raise TypeError("The tesseract model has the wrong type. Please use only best model!")
 
     current_process().daemon = False
-
     # try to minimize what is loaded in memory for large datasets
     ground_truth = list(qs.values('content',
                                   baseline=F('line__baseline'),
@@ -581,28 +589,9 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
                         image = Image.open(imagepath)
                     vertical = 'vertical' in lt['script']
                     rtl_cnt += 'rl' in lt['script']
-                    bbox = Polygon(lt['mask']).bounds
-                    cutout = image.crop(bbox)
-                    if expert_settings.mask_polygon:
-                        # Background
-                        if expert_settings.mask_coloring == 'white':
-                            bg = Image.new("L", cutout.size, 255)
-                        else:
-                            # Get dominant color
-                            img = cutout.copy()
-                            img = img.convert(cutout.mode)
-                            img = img.resize((1, 1), resample=0)
-                            dominant_color = img.getpixel((0, 0))
-                            bg = Image.new(cutout.mode, cutout.size, dominant_color)
-                        mask = Image.new("L", cutout.size, 255)
-                        # Mask text region
-                        draw = ImageDraw.Draw(mask)
-                        draw.polygon([(point[0]-bbox[0], point[1]-bbox[1]) for point in lt['mask']], 0, 1)
-                        if expert_settings.mask_smoothing:
-                            mask = mask.filter(ImageFilter.GaussianBlur(3))
-                        # Combine bg and cutout
-                        cutout.paste(bg, (0, 0), mask)
-                    api.WriteLSTMFLinepair(filepath.with_suffix('').name, str(filepath.parent.resolve()), cutout,
+                    cutout = crop_image(image, lt['mask'],expert_settings.crop_polygon,
+                                        expert_settings.crop_smoothing, expert_settings.crop_background)
+                    api.WriteLSTMFLineData(filepath.with_suffix('').name, str(filepath.parent.resolve()), cutout,
                                        lt['content'], vertical)
                 locked_files.append(filepath.open('r'))
                 fcntl.flock(locked_files[-1], fcntl.LOCK_SH)
@@ -637,6 +626,7 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
         np.random.default_rng(241960353267317949653744176059648850005).shuffle(ground_truth)
         eval_cc = Counter('\n'.join([lt['content'] for lt in ground_truth[:partition]]))
         train_cc = Counter('\n'.join([lt['content'] for lt in ground_truth[partition:]]))
+        avg_char_per_iteration = int(sum(train_cc.values())/(len(ground_truth)-partition))
         all_unicodes_fpath = model_dir.joinpath('all_unicodes')
         all_unicodes_fpath.open('w').write('\n'.join(train_cc.keys()))
 
@@ -659,13 +649,18 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
 
     def store_checkpoint_as_model(ckpt_path, model_path, start_model_path):
         try:
-            print(f"Converting checkpoint to model: {ckpt_path} -> {model_path}")
-            conv_output = subprocess.check_output(shlex.split("lstmtraining --stop_training "
-                                                              f"--continue_from {ckpt_path} "
-                                                              f"--traineddata {start_model_path} "
-                                                              f"--model_output {model_path}"), stderr=subprocess.STDOUT)
+            logger.info(f"Converting checkpoint to model: {ckpt_path.relative_to(settings.MEDIA_ROOT)} "
+                        f"-> {model_path.relative_to(settings.MEDIA_ROOT)}")
+            subprocess.run(shlex.split(f"lstmtraining --stop_training "
+                                       f"--continue_from {str(ckpt_path.absolute())} "
+                                       f"--traineddata {str(start_model_path.absolute())} "
+                                       f"--model_output {str(model_path.absolute())}"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Clean checkpoints
+            ckpt_path.unlink()
         except:
-            print("Could not store checkpoint as model.")
+            logger.error("Could not store checkpoint as model.")
+            pass
 
     def get_necessary_datafiles(data_dir):
 
@@ -683,7 +678,7 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
         for datafile in datafiles:
             subprocess.run(shlex.split(f"wget -P {str(data_dir.absolute())} "
                                        f"'https://github.com/tesseract-ocr/langdata_lstm/raw/main/{datafile}'"),
-                           stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Inherited unicharset (not included in the official tesseract trainingsdata)
         data_dir.joinpath('Inherited.unicharset').open('w').write("""53
 NULL 0 Common 0
@@ -741,16 +736,15 @@ NULL 0 Common 0
 ゙ 0 210,221,228,230,43,46,133,157,193,205 Inherited 54 17 54 ゙	# ゙ [3099 ]""")
         return
 
-    def _train_tesseract(learning_rate=0.0001, max_iterations=10000, target_error_rate=0.01, norm_mode=2,
+    def _train_tesseract(*, learning_rate=0.0001, max_iterations=10000, max_model_timedelta=10000,
+                         min_target_error_rate=1.0, target_error_rate=0.01, norm_mode=2,
                         net_spec="[1,36,0,1 Ct3,3,16 Mp3,3 Lfys48 Lfx96 Lrx96 Lfx192 O1c\#\#\#]"):
         """runs preprocessing and tesseract training with subprocess"""
 
         def _print_eval(ckpt_path, epoch="0", accuracy="0", chars=0, error=0, val_metric=0):
-            print(f"Wrote checkpoint:   {ckpt_path}\n"
-                  f"Current iterations: {epoch}\n"
-                  f"Current accuracy:   {accuracy}")
-
-        # create training and eval listfiles
+            logger.info(f"Wrote checkpoint:   {ckpt_path}\n"
+                        f"Current iterations: {epoch}\n"
+                        f"Current accuracy:   {accuracy}")
 
         # Radical stroke (for proto model creation)
         radical_stroke = trainingsdata_dir.joinpath("radical-stroke.txt")
@@ -763,7 +757,7 @@ NULL 0 Common 0
                        f"--debug_interval 0 " \
                        f"--traineddata {str(proto_model.absolute())} " \
                        f"--learning_rate {learning_rate} " \
-                       f"--model_output {model_dir.joinpath('checkpoints')} " \
+                       f"--model_output {str(model_dir.absolute())} " \
                        f"--train_listfile {str(trainingslist_fpath.absolute())} " \
                        f"--eval_listfile {str(evaluationlist_fpath.absolute())} " \
                        f"--max_iterations {max_iterations} " \
@@ -776,28 +770,28 @@ NULL 0 Common 0
             if not model_dir.joinpath(model.name + '.lstm').exists():
                 subprocess.run(shlex.split(f"combine_tessdata "
                                                f"-u {model.file.file.name} "
-                                               f"{model_dir.joinpath(model.name)}"),
-                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL )
+                                               f"{str(model_dir.joinpath(model.name).absolute())}"),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL )
 
             # create unicharset
             if not model_dir.joinpath('my.unicharset').exists():
                 subprocess.run(shlex.split(f"unicharset_extractor "
                                            f"--output_unicharset "
-                                           f"{model_dir.joinpath('my.unicharset')} "
+                                           f"{str(model_dir.joinpath('my.unicharset').absolute())} "
                                            f"--norm_mode "
                                            f"{norm_mode} {str(all_unicodes_fpath.absolute())}"),
-                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(shlex.split(f"merge_unicharsets "
-                                           f"{model_dir.joinpath(model.name + '.lstm-unicharset')} "
-                                           f"{model_dir.joinpath('my.unicharset')} "
-                                           f"{model_dir.joinpath('unicharset')}"),
-                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                           f"{str(model_dir.joinpath(model.name + '.lstm-unicharset').absolute())} "
+                                           f"{str(model_dir.joinpath('my.unicharset').absolute())} "
+                                           f"{str(model_dir.joinpath('unicharset').absolute())}"),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Training cmd
             training_cmd = training_cmd + f"--old_traineddata " \
                                           f"{model.file.file.name} " \
                                           f"--continue_from " \
-                                          f"{model_dir.joinpath(model.name + '.lstm')}"
+                                          f"{str(model_dir.joinpath(model.name + '.lstm').absolute())}"
 
         else:
             # Create a placeholder model
@@ -808,10 +802,10 @@ NULL 0 Common 0
             # Create new model
             subprocess.run(shlex.split(f"unicharset_extractor "
                                        f"--output_unicharset "
-                                       f"{model_dir.joinpath('my.unicharset')} "
+                                       f"{str(model_dir.joinpath('my.unicharset').absolute())} "
                                        f"--norm_mode "
                                        f"{norm_mode} {str(all_unicodes_fpath.absolute())}"),
-                           stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             net_spec = net_spec.replace('\#\#\#', str(len(train_cc)))
             training_cmd = training_cmd + f"--net_spec {net_spec})"
 
@@ -821,7 +815,7 @@ NULL 0 Common 0
             proto_cmd += "--lang_is_rtl " if rtl else ""
             proto_cmd += "--pass_through_recoder " if norm_mode > 2 else ""
             proto_cmd += f"--input_unicharset " \
-                         f"{model_dir.joinpath('unicharset').absolute()} " \
+                         f"{str(model_dir.joinpath('unicharset').absolute())} " \
                          f"--lang {model.name} " \
                          f"--script_dir {str(trainingsdata_dir.absolute())} " \
                          f'--version_str "Trained at {date.today()} with eScriptorium." ' \
@@ -832,55 +826,65 @@ NULL 0 Common 0
                                        f"--numbers {model_name}.numbers "
                                        f"--puncs {model_name}.punc "))
             """
-            subprocess.run(shlex.split(proto_cmd), stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(shlex.split(proto_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # Start training
-        print(training_cmd)
+        logger.info(training_cmd)
         process = subprocess.Popen(shlex.split(training_cmd), stderr=subprocess.PIPE)
 
         # Read process output on the fly and create new models automatically
+        ckpt_path, current_bestmodel_path = Path(), Path()
+        time_last_model = time.time()
         for c in iter(lambda: process.stderr.readline(), b""):
             text = c.decode()
-            print(text)
+            logger.info(text)
             if "wrote best model" in text:
-                ckpt_path = text.split('best model:')[1].split(' ', 1)[0]
+                # Delete second last checkpoint if it exists
+                if ckpt_path.name.endswith('checkpoint') and ckpt_path.exists() and current_bestmodel_path.exists():
+                    ckpt_path.resolve().unlink()
+                ckpt_path = Path(text.split('best model:')[1].split(' ', 1)[0])
                 accuracy = text.split('=')[3].split(',', 1)[0]
-                epoch = text.split('/', 2)[2].split(',', 1)[0]
-                _print_eval(ckpt_path, epoch, accuracy, 0, 0)
+                iterations = text.split('/', 2)[2].split(',', 1)[0]
+                _print_eval(str(ckpt_path), iterations, accuracy, 0, 0)
                 # -> Convert checkpoint to best model and save it
-                relpath = Path(model.file.path).parent.relative_to(settings.MEDIA_ROOT)
-                current_bestmodel_path = relpath.joinpath(f'verion_{epoch}.traineddata')
+                epoch = int(int(iterations)/100)
+                current_bestmodel_path = Path(model.file.path).parent.joinpath(f'version_{epoch}.traineddata')
+                current_bestmodel_relpath = current_bestmodel_path.relative_to(settings.MEDIA_ROOT)
                 store_checkpoint_as_model(ckpt_path,
-                                          current_bestmodel_path,
-                                          model.file.file.name)
-                # Add model to eScritporium
+                                  current_bestmodel_path,
+                                  Path(model.file.file.name))
+                # Add model to eScriptorium database
                 model.refresh_from_db()
                 model.training_epoch = epoch
-                model.training_accuracy = float(accuracy)
-                model.training_total = int(epoch)
-                model.training_errors = 100.0-float(accuracy)
-                model.new_version(file=str(current_bestmodel_path))
+                model.training_accuracy = (100.0-float(accuracy[:-1]))/100
+                model.training_total = avg_char_per_iteration*int(iterations)
+                model.training_errors = int((1-model.training_accuracy)*model.training_total)
+                model.new_version(file=str(current_bestmodel_relpath))
                 model.save()
-
                 send_event('document', document.pk, "training:eval", {
-                    "id": model.pk,
+                    'id': model.pk,
                     'versions': model.versions,
                     'epoch': epoch,
-                    'accuracy': float(accuracy),
-                    'chars': '',
-                    'error': ''})
+                    'accuracy': model.training_accuracy,
+                    'chars': model.training_total,
+                    'error': model.training_errors})
+                if (1-model.training_accuracy)*100 < min_target_error_rate:
+                    if max_model_timedelta > 0 and time_last_model < time.time()+max_model_timedelta:
+                        process.kill()
+                        return
+                time_last_model = time.time()
             if "is an integer (fast) model, cannot continue training" in text:
                 user.notify(_("Only tesseracts best models can be trained!"),
                             id="training-tesseract", level='warning')
                 process.kill()
                 # Delete stuff
-                # shutil.rmtree(str(model_dir.parent.absolute()))
-                # model.delete()
-
+                Path(model.file.file.name).unlink()
+                model.delete()
                 raise ValueError
     try:
-        _train_tesseract(learning_rate=0.0001, max_iterations=10000, target_error_rate=0.01, norm_mode=2,
-                    net_spec="[1,36,0,1 Ct3,3,16 Mp3,3 Lfys48 Lfx96 Lrx96 Lfx192 O1c\#\#\#]")
+        _train_tesseract(learning_rate=0.0001, max_iterations=10000, max_model_timedelta=10,
+                         min_target_error_rate=3.0, target_error_rate=0.01, norm_mode=2,
+                         net_spec="[1,36,0,1 Ct3,3,16 Mp3,3 Lfys48 Lfx96 Lrx96 Lfx192 O1c\#\#\#]")
     except:
         pass
     unlock_files(locked_files)

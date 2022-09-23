@@ -1215,10 +1215,13 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
                     for symbol_idx, symbol in enumerate(iterate_level(ri, RIL.SYMBOL)):
                         if symbol.IsAtBeginningOf(RIL.WORD) and content != "":
                             content += " "
-                        content += symbol.GetUTF8Text(RIL.SYMBOL)
-                        graph.append({'c': symbol.GetUTF8Text(RIL.SYMBOL),
+                        try:
+                            content += symbol.GetUTF8Text(RIL.SYMBOL)
+                            graph.append({'c': symbol.GetUTF8Text(RIL.SYMBOL),
                                       'poly': symbol.BoundingBoxInternal(RIL.SYMBOL),
                                       'confidence': float(symbol.Confidence(RIL.SYMBOL)) / 100})
+                        except:
+                            continue
                     lt.content = content
                     lt.graph = graph
                     lt.save()
