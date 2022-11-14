@@ -407,7 +407,7 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     name = forms.CharField()
     file = forms.FileField(
         validators=[FileExtensionValidator(
-            allowed_extensions=['mlmodel', 'traineddata'])])
+            allowed_extensions=['calamarimodel', 'mlmodel', 'traineddata'])])
 
     class Meta:
         model = OcrModel
@@ -420,7 +420,7 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     def clean_file(self):
         # Early validation of the model loading
         file_field = self.cleaned_data['file']
-        if file_field.file.name.rsplit('.', 1)[-1] == 'traineddata':
+        if file_field.file.name.rsplit('.', 1)[-1] in ['traineddata', 'calamarimodel']:
             self._model_job = 'recognition'
             self.model_metadata = None
             return file_field
@@ -609,8 +609,9 @@ class SegmentForm(BootstrapFormMixin, DocumentProcessFormBase):
 # https://code.djangoproject.com/ticket/27331#comment:7
 
 class GroupedModelChoiceIterator(ModelChoiceIterator):
-    def __init__(self, field, groupby):
+    def __init__(self, field, groupby, sort=None):
         self.groupby = groupby
+        self.sort = sort
         super().__init__(field)
 
     def __iter__(self):
@@ -748,7 +749,8 @@ class SegTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
 
 class RecTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
     model_name = forms.CharField(required=False)
-    model = forms.ModelChoiceField(queryset=OcrModel.objects.filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
+    model = GroupedModelChoiceField(queryset=OcrModel.objects.filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
+                                   choices_groupby='engine',
                                    required=False)
     transcription = forms.ModelChoiceField(queryset=Transcription.objects.all(), required=False)
     override = forms.BooleanField(required=False, label="Overwrite existing model file")
@@ -760,6 +762,14 @@ class RecTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
     @property
     def model_job(self):
         return OcrModel.MODEL_JOB_RECOGNIZE
+
+    def sorted(self):
+        import operator
+        modellist = [(x,y) for x,y  in list(groupby(self.fields['model'].queryset, attrgetter('engine'))) if x is not None]
+        modellist.sort(key=lambda y: y[0])
+        modelset = self.fields['model']
+        modelset.field.widget.choices = modellist
+        return self.fields
 
     def process(self):
         model = self.cleaned_data.get('model')

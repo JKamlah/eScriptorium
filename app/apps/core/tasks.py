@@ -19,7 +19,6 @@ from easy_thumbnails.files import get_thumbnailer
 from kraken.lib import train as kraken_train
 # DO NOT REMOVE THIS IMPORT, it will break celery tasks located in this file
 from reporting.tasks import create_task_reporting  # noqa F401
-from sympy.codegen.ast import stderr
 from users.consumers import send_event
 
 logger = logging.getLogger(__name__)
@@ -471,7 +470,7 @@ def crop_image(image, mask, polygon=True, smooth=True, background='dominant'):
     from shapely.geometry import Polygon
     from PIL import Image, ImageDraw, ImageFilter
     bbox = Polygon(mask).bounds
-    cutout = image.crop(mask)
+    cutout = image.crop(bbox)
     if polygon:
         # Background
         if background == 'white':
@@ -483,19 +482,272 @@ def crop_image(image, mask, polygon=True, smooth=True, background='dominant'):
             img = img.resize((1, 1), resample=0)
             dominant_color = img.getpixel((0, 0))
             bg = Image.new(cutout.mode, cutout.size, dominant_color)
-        mask = Image.new("L", cutout.size, 255)
+        mask_img = Image.new("L", cutout.size, 255)
         # Mask text region
-        draw = ImageDraw.Draw(mask)
-        draw.polygon([(point[0] - bbox[0], point[1] - bbox[1]) for point in lt['mask']], 0, 1)
+        draw = ImageDraw.Draw(mask_img)
+        draw.polygon([(point[0] - bbox[0], point[1] - bbox[1]) for point in mask], 0, 1)
         if smooth:
-            mask = mask.filter(ImageFilter.GaussianBlur(3))
+            mask_img = mask_img.filter(ImageFilter.GaussianBlur(3))
         # Combine bg and cutout
-        cutout.paste(bg, (0, 0), mask)
+        cutout.paste(bg, (0, 0), mask_img)
     return cutout
+
+def update_calamarimodel(model):
+    """ Updates Calamarimodels from Version to the newest version """
+    from pathlib import Path
+    from zipfile import ZipFile
+    from calamari_ocr.ocr import SavedCalamariModel
+
+    if not model.file.path.endswith('.calamarimodel'):
+        return False
+    try:
+        model_path = Path(model.file.path).parent
+        with ZipFile(model.file.path, 'r') as zipped:
+            zipped.extractall(str(model_path.absolute()))
+        list_json = list(model_path.glob('*.json'))
+        Path(model.file.path).unlink()
+        for jsonfpath in list_json:
+            calamarimodel = SavedCalamariModel(str(jsonfpath.absolute()))
+            calamarimodel.update_checkpoint()
+        for old_files in model_path.glob('*.json_*'):
+            old_files.unlink()
+            old_files.parent.joinpath(old_files.name.replace('.json_', '.h5_')).unlink()
+        with ZipFile(model.file.path, 'w') as zipped:
+            for jsonfpath in list_json:
+                zipped.write(str(jsonfpath.absolute()), jsonfpath.name)
+                [zipped.write(str(modelfiles.absolute()), str(modelfiles.absolute().relative_to(model_path))) for
+                 modelfiles in model_path.joinpath(jsonfpath.name.replace('.json', '')).rglob('*')
+                 if modelfiles.is_file()]
+    except:
+        return False
+
+    return True
+
+def default_expert_settings():
+    from collections import namedtuple
+    expert_settings = namedtuple('Expert_Settings', 'mask_polygon')
+    expert_settings.crop_polygon = True
+    expert_settings.crop_smoothing = True
+    expert_settings.crop_background = 'dominant'
+    return expert_settings
+
+def train_calamari(qs, document, transcription, model=None, user=None, expert_settings=None):
+    from dataclasses import dataclass, field
+    import json
+    from multiprocessing import current_process
+    import os
+    import sys
+    from typing import List, Generator, Type
+
+    from calamari_ocr.ocr.dataset.datareader.base import (
+        CalamariDataGenerator,
+        CalamariDataGeneratorParams,
+        SampleMeta,
+        InputSample)
+    from calamari_ocr.ocr.scenario import CalamariScenario
+    from calamari_ocr.utils.image import to_uint8
+    from paiargparse import pai_dataclass
+    from PIL import Image
+    import tensorflow.keras as keras
+    from tfaip.data.pipeline.definitions import PipelineMode
+    from tfaip.data.pipeline.datagenerator import DataGenerator
+    from tfaip.util.tftyping import sync_to_numpy_or_python_type
+
+    current_process().daemon = False
+
+    # Load expert settings
+    expert_settings = default_expert_settings() if expert_settings is None else expert_settings
+
+    # try to minimize what is loaded in memory for large datasets
+    ground_truth = list(qs.values('content',
+                                  baseline=F('line__baseline'),
+                                  external_id=F('line__external_id'),
+                                  mask=F('line__mask'),
+                                  image=F('line__document_part__image')))
+    ground_truth = [lt for lt in ground_truth if lt['mask'] is not None]
+    if not ground_truth:
+        raise ValueError('No ground truth provided.')
+    partition = int(len(ground_truth) / 10)
+    traindata = {'images': [], 'texts': [], 'ids': []}
+    imagepath = ""
+    image = Image.Image()
+
+    for lt in ground_truth:
+        if imagepath != os.path.join(settings.MEDIA_ROOT, lt['image']):
+            imagepath = os.path.join(settings.MEDIA_ROOT, lt['image'])
+            image = Image.open(imagepath)
+        traindata['images'].append(crop_image(image, lt['mask'], expert_settings.crop_polygon,
+                            expert_settings.crop_smoothing, expert_settings.crop_background))
+        traindata['texts'].append(lt['content'])
+        traindata['ids'].append(lt['external_id'])
+    image.close()
+
+    # Convert to uint8
+    traindata['images'] = [to_uint8(np.asarray(img.convert('L'))) for img in traindata['images']]
+
+    # Shuffle lists
+    np.random.default_rng(241960353267317949653744176059648850006).shuffle(traindata['images'])
+    np.random.default_rng(241960353267317949653744176059648850006).shuffle(traindata['texts'])
+    np.random.default_rng(241960353267317949653744176059648850006).shuffle(traindata['ids'])
+    p = CalamariScenario.default_trainer_params()
+
+    @pai_dataclass
+    @dataclass
+    class eScriptoriumDataReaderParams(CalamariDataGeneratorParams):
+        images: List[str] = field(default_factory=list)
+        texts: List[str] = field(default_factory=list)
+        ids: List[str] = field(default_factory=list)
+        preload = True
+        skip_invalid = False
+        def to_prediction(self):
+            raise NotImplementedError
+
+        def __len__(self):
+            return len(self.images)
+        @staticmethod
+        def cls() -> Type["DataGenerator"]:
+            return eScriptoriumDataReader
+
+    class eScriptoriumDataReader(CalamariDataGenerator[eScriptoriumDataReaderParams]):
+        def __init__(self, mode: PipelineMode, params: eScriptoriumDataReaderParams):
+            """Create a dataset from memory"""
+            super().__init__(mode, params)
+            self.chars = 0
+            for image, text, id in zip(params.images, params.texts, params.ids):
+                meta = SampleMeta(id)
+                self.add_sample(
+                    {
+                        "image": image,
+                        "text": text,
+                        "id": meta.id,
+                        "meta": meta,
+                    }
+                )
+                self.chars += len(text)
+            self.loaded = True
+        def _load_sample(self, sample, text_only) -> Generator[InputSample, None, None]:
+            if text_only:
+                yield InputSample(None, sample["text"], sample["meta"])
+            yield InputSample(sample["image"], sample["text"], sample["meta"])
+
+    p.gen.train = eScriptoriumDataReaderParams(images=traindata['images'][partition:],
+                                      texts=traindata['texts'][partition:],
+                                      ids=traindata['ids'][partition:])
+
+    p.gen.val = eScriptoriumDataReaderParams(images=traindata['images'][:partition],
+                                      texts=traindata['texts'][:partition],
+                                      ids=traindata['ids'][:partition])
+    p.preload = True
+    p.gen.setup.val.batch_size = 1
+    p.gen.setup.val.num_processes = 1
+    p.gen.setup.train.batch_size = 1
+    p.gen.setup.train.num_processes = 1
+    p.epochs = 10
+    p.samples_per_epoch = 1
+    p.scenario.data.__post_init__()
+    p.scenario.__post_init__()
+    p.__post_init__()
+
+    model_dir = os.path.join(settings.MEDIA_ROOT, os.path.split(model.file.path)[0])
+
+    # create the trainer and run it
+    trainer = p.scenario.cls().create_trainer(p)
+
+    class TrainerCheckpointsCallback(keras.callbacks.ModelCheckpoint):
+        """
+        Callback to store the current state of the trainer params and the current training model with
+        all of its weights which is required for resuming the training.
+
+        This is realized by reimplementing some of the methods of the keras ModelCheckpoint-Callback which is a base class.
+        """
+
+        def __init__(self, train_params, save_freq=None, store_weights=True, store_params=True):
+            # before the actual ModelCheckpoint base is initialized, determine the ckpt_dir
+            logs = None
+            log_dir = train_params.output_dir
+            if log_dir and train_params.checkpoint_sub_dir:
+                log_dir = os.path.join(log_dir, train_params.checkpoint_sub_dir)
+
+            ckpt_dir = os.path.join(log_dir, "variables", "variables") if log_dir else ""
+
+            if ckpt_dir is None or save_freq is None:
+                save_freq = sys.maxsize  # never
+
+            # Init of the parent
+            super().__init__(
+                ckpt_dir,
+                save_weights_only=True,
+                save_freq=save_freq,
+            )
+
+            # Set additional members
+            self.log_dir = log_dir
+            self.train_params = train_params
+            self.store_weights = store_weights
+            self.store_params = store_params
+
+        def _print_eval(self, epoch=0, accuracy=0, chars=0, error=0, val_metric=0):
+            model.refresh_from_db()
+            model.training_epoch = epoch
+            model.training_accuracy = float(accuracy)
+            model.training_total = int(chars)
+            model.training_errors = int(error)
+            relpath = os.path.relpath(model_dir, settings.MEDIA_ROOT)
+            model.new_version(file=f'{relpath}/version_{epoch}.calamarimodel')
+            model.save()
+
+            send_event('document', document.pk, "training:eval", {
+                "id": model.pk,
+                'versions': model.versions,
+                'epoch': epoch,
+                'accuracy': float(accuracy),
+                'chars': int(chars),
+                'error': int(error)})
+
+        def _save_model(self, epoch, logs):
+            # Override save model to either store weights or the params
+            if self.store_params:
+                if isinstance(self.save_freq, int) or self.epochs_since_last_save >= self.period:
+                    logs = sync_to_numpy_or_python_type(logs)
+                    # Crop variables/variables of the path
+                    filepath = os.path.abspath(os.path.join(self._get_file_path(epoch, logs), "..", ".."))
+                    self.train_params.current_epoch = epoch + 1
+                    self.train_params.saved_checkpoint_sub_dir = os.path.relpath(filepath, self.train_params.output_dir)
+                    self._save_params(filepath)
+
+            if self.store_weights:
+                super()._save_model(epoch, logs)
+
+        def _save_params(self, filepath):
+            # Save the params only
+            os.makedirs(filepath, exist_ok=True)
+            path = os.path.join(filepath, "trainer_params.json")
+            logger.debug(f"Logging current trainer state to '{path}'")
+            with open(path, "w") as f:
+                json.dump(self.train_params.to_dict(), f, indent=2)
+
+        def on_epoch_end(self, epoch, logs=None):
+            # we ended an epoch, store that we ended it
+            self.train_params.current_epoch = epoch + 1
+            super().on_epoch_end(epoch, logs)
+            if self.save_freq == 'epoch':
+                self._save_model(epoch=epoch, logs=logs)
+                self._print_eval(epoch=epoch+1,
+                                 accuracy=int(logs.get('val_CER', 0)),
+                                 chars=int(self.train_params.gen.train.chars*(epoch+1)),
+                                 error=int(self.train_params.gen.train.chars*(epoch+1)*logs.get('CER', 1)),
+                                 val_metric=0)
+
+    checkpoint_callback = TrainerCheckpointsCallback(p,
+                                                     save_freq='epoch',
+                                                     store_weights=True,
+                                                     store_params=True)
+    trainer.train(callbacks=[checkpoint_callback])
+
 
 def train_tesseract(qs, document, transcription, model=None, user=None, expert_settings=None):
     # # Note hack to circumvent AssertionError: daemonic processes are not allowed to have children
-    from collections import Counter, namedtuple
+    from collections import Counter
     from multiprocessing import current_process
     from hashlib import sha256
     import fcntl
@@ -533,11 +785,7 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
         return
 
     # Placeholder for up comming "Expert Settings"
-    if expert_settings is None:
-        expert_settings = namedtuple('Expert_Settings', 'mask_polygon')
-        expert_settings.crop_polygon = True
-        expert_settings.crop_smoothing = True
-        expert_settings.crop_background = 'dominant'
+    expert_settings = default_expert_settings() if expert_settings is None else expert_settings
 
     # Currently just checking if the model is trainable (best model)
     # TODO: Convert model from fast to best instead and than train with that
@@ -883,7 +1131,7 @@ NULL 0 Common 0
                 raise ValueError
     try:
         _train_tesseract(learning_rate=0.0001, max_iterations=10000, max_model_timedelta=10,
-                         min_target_error_rate=3.0, target_error_rate=0.01, norm_mode=2,
+                         min_target_error_rate=0.0, target_error_rate=0.01, norm_mode=2,
                          net_spec="[1,36,0,1 Ct3,3,16 Mp3,3 Lfys48 Lfx96 Lrx96 Lfx192 O1c\#\#\#]")
     except:
         pass
@@ -926,8 +1174,10 @@ def train(task, transcription_pk, model_pk=None, part_pks=None, user_pk=None, **
               .filter(transcription=transcription,
                       line__document_part__pk__in=part_pks)
               .exclude(Q(content='') | Q(content=None)))
-        {"kraken": train_kraken,
-        "tesseract": train_tesseract}.get(model.engine, train_kraken)(qs, document, transcription, model=model, user=user)
+        {"calamari": train_calamari,
+         "kraken": train_kraken,
+         "tesseract": train_tesseract}.get(model.engine, train_kraken)(qs, document, transcription,
+                                                                       model=model, user=user)
     except Exception as e:
         send_event('document', document.pk, "training:error", {
             "id": model.pk,

@@ -1132,7 +1132,8 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
         else:
             reorder = 'L'
 
-        {"kraken": self.transcribe_kraken,
+        {"calamari": self.transcribe_calamari,
+         "kraken": self.transcribe_kraken,
          "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, trans, text_direction, reorder)
 
         self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
@@ -1186,11 +1187,62 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
                         pred.prediction, pred.cuts, pred.confidences)]
                 lt.save()
 
+
+
+    def transcribe_calamari(self, model, lines, trans, text_direction, reorder):
+        from pathlib import Path
+        from zipfile import ZipFile
+        from core.tasks import update_calamarimodel
+
+        try:
+            from calamari_ocr.ocr.predict.predictor import (
+                Predictor,
+                PredictorParams,
+            )
+            from calamari_ocr.utils.image import to_uint8
+            from calamari_ocr.ocr import SavedCalamariModel
+
+        except Exception as e:
+            logger.error(e)
+            # Calamari is not installed
+            # Currently this branch is needed https://github.com/Calamari-OCR/calamari/tree/tempscale
+            raise ValueError
+        model_path = Path(model.file.path).parent
+        list_json = list(model_path.glob('*.json'))
+        if not list_json:
+            if not update_calamarimodel(model):
+                raise ValueError
+            list_json = list(model_path.glob('*.json'))
+        model_fpath = sorted(list_json)[0]
+        params = PredictorParams(progress_bar=False, silent=True)
+        params.pipeline.batch_size = 1
+        params.pipeline.num_processes = 1
+        predictor = Predictor.from_checkpoint(params, checkpoint=str(model_fpath.absolute()),
+                                              auto_update_checkpoints=False)
+        with Image.open(self.image.file.name) as im:
+            for idx, line in enumerate(lines):
+                bounds = {
+                    "baseline": line.baseline,
+                    "mask": line.mask,
+                    "type": "bounding_box",
+                    # 'script_detection': Tru
+                    }
+                lt, created = LineTranscription.objects.get_or_create(
+                    line=line, transcription=trans)
+                # Calamari only excepts grayscale?
+                cutout = im.crop(line.box).convert('L')
+                graph = list()
+                for result in predictor.predict_raw([to_uint8(np.asarray(cutout))]):
+                    content = result.outputs.sentence
+                    for pos in result.outputs.positions:
+                        graph.append({'c': predictor.data.params.codec.code2char[pos.chars[0].label],
+                                      'poly': line.mask,
+                                      'confidence': pos.chars[0].probability})
+                lt.content = content
+                lt.graph = graph
+                lt.save()
     def transcribe_tesseract(self, model, lines, trans, text_direction, reorder):
         from tesserocr import PyTessBaseAPI, RIL, iterate_level
-        from shapely.affinity import scale, translate, rotate, interpret_origin
-        from shapely.geometry import Polygon, Point, LineString, MultiPoint
-        from shapely.ops import split, nearest_points
         model_ = model.file.path
         with Image.open(self.image.file.name) as im:
             with PyTessBaseAPI(path=os.path.dirname(model.file.path),
@@ -1704,7 +1756,7 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
     file = models.FileField(
         upload_to=models_path,
         null=True,
-        validators=[FileExtensionValidator(allowed_extensions=["mlmodel", "traineddata"])],
+        validators=[FileExtensionValidator(allowed_extensions=["calamarimodel", "mlmodel", "traineddata"])],
     )
     file_size = models.BigIntegerField()
 
@@ -1749,7 +1801,8 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
 
     @cached_property
     def engine(self):
-        return {'mlmodel': 'kraken',
+        return {'calamarimodel': 'calamari',
+                'mlmodel': 'kraken',
                 'traineddata': 'tesseract'}.get(self.file.name.rsplit('.', 1)[-1])
 
     @cached_property
