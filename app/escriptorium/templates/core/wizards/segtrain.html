@@ -1,3 +1,17 @@
+<script>
+function segmodelkeywordfilter(keyword) {
+    var select = document.getElementById("existing_segmodels").querySelector('#id_model');
+    for (var i = 1; i < select.length; i++) {
+        var modelname = select.options[i].text;
+        if (!modelname.match(keyword)) {
+            $(select.options[i]).attr('disabled', 'disabled').hide();
+        } else {
+            $(select.options[i]).removeAttr('disabled').show();
+        }
+    }
+};
+</script>
+
 {% extends 'core/wizards/_base.html' %}
 {% load i18n bootstrap %}
 
@@ -12,8 +26,14 @@
 </div>
 <div class="form-group">
   <h5>{% trans "Or select an existing one" %}</h5>
-  {% render_field segtrain_form.model class="js-proc-settings" %}
-  {% render_field segtrain_form.override class="js-proc-settings" %}
+   <div id="existing_segmodels">
+    {% render_field segtrain_form.model class="js-proc-settings" %}
+    <h6 style="display:inline-block; width:20%">{% trans "Filter options" %}</h6>
+      <input type="text" placeholder="Filter by keyword.." id="modelfilter_keyword" onkeyup="segmodelkeywordfilter(value)"
+      class="form-control js-proc-settings"
+      style="display:inline-block; width:50%">
+   {% render_field segtrain_form.override class="js-proc-settings" %}
+   </div>
 </div>
 {% endblock %}
 

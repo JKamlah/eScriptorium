@@ -2,7 +2,11 @@ import logging
 import re
 from datetime import datetime
 from os.path import basename, splitext
+from functools import partial
+from itertools import groupby
+from operator import attrgetter
 
+from PIL import Image
 from bootstrap.forms import BootstrapFormMixin
 from django import forms
 from django.conf import settings
@@ -511,7 +515,7 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     name = forms.CharField()
     file = forms.FileField(
         validators=[FileExtensionValidator(
-            allowed_extensions=['mlmodel'])])
+            allowed_extensions=['calamarimodel', 'mlmodel', 'traineddata'])])
 
     class Meta:
         model = OcrModel
@@ -524,6 +528,10 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     def clean_file(self):
         # Early validation of the model loading
         file_field = self.cleaned_data['file']
+        if file_field.file.name.rsplit('.', 1)[-1] in ['traineddata', 'calamarimodel']:
+            self._model_job = 'recognition'
+            self.model_metadata = None
+            return file_field
         try:
             model = vgsl.TorchVGSLModel.load_model(file_field.file.name)
         except KrakenInvalidModelException:
@@ -733,16 +741,45 @@ class SegmentForm(BootstrapFormMixin, DocumentProcessFormBase):
                       model_pk=model and model.pk or None,  # None means default model
                       override=self.cleaned_data.get('override'))
 
+# Implementation of grouped model choices
+# https://code.djangoproject.com/ticket/27331#comment:7
+
+class GroupedModelChoiceIterator(ModelChoiceIterator):
+    def __init__(self, field, groupby, sort=None):
+        self.groupby = groupby
+        self.sort = sort
+        super().__init__(field)
+
+    def __iter__(self):
+        if self.field.empty_label is not None:
+            yield ("", self.field.empty_label)
+        queryset = self.queryset
+        # Can't use iterator() when queryset uses prefetch_related()
+        if not queryset._prefetch_related_lookups:
+            queryset = queryset.iterator()
+        for group, objs in groupby(queryset, self.groupby):
+            yield (group, [self.choice(obj) for obj in objs])
+
+
+class GroupedModelChoiceField(ModelChoiceField):
+    def __init__(self, *args, choices_groupby, **kwargs):
+        if isinstance(choices_groupby, str):
+            choices_groupby = attrgetter(choices_groupby)
+        elif not callable(choices_groupby):
+            raise TypeError('choices_groupby must either be a str or a callable accepting a single argument')
+        self.iterator = partial(GroupedModelChoiceIterator, groupby=choices_groupby)
+        super().__init__(*args, **kwargs)
+
 
 class TranscribeForm(BootstrapFormMixin, DocumentProcessFormBase):
-    model = forms.ModelChoiceField(
-        queryset=OcrModel.objects.filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
-        required=False)
+    model = GroupedModelChoiceField(queryset=OcrModel.objects
+                                   .filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
+                                   choices_groupby='engine',
+                                   required=False)
     transcription = forms.ModelChoiceField(
         queryset=Transcription.objects.filter(archived=False),
         empty_label=_('-- New --'),
         required=False)
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -1057,7 +1094,8 @@ class SegTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
 
 class RecTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
     model_name = forms.CharField(required=False)
-    model = forms.ModelChoiceField(queryset=OcrModel.objects.filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
+    model = GroupedModelChoiceField(queryset=OcrModel.objects.filter(job=OcrModel.MODEL_JOB_RECOGNIZE),
+                                   choices_groupby='engine',
                                    required=False)
     transcription = forms.ModelChoiceField(queryset=Transcription.objects.all(), required=False)
     override = forms.BooleanField(required=False, label="Overwrite existing model file")
@@ -1069,6 +1107,14 @@ class RecTrainForm(BootstrapFormMixin, TrainMixin, DocumentProcessFormBase):
     @property
     def model_job(self):
         return OcrModel.MODEL_JOB_RECOGNIZE
+
+    def sorted(self):
+        import operator
+        modellist = [(x,y) for x,y  in list(groupby(self.fields['model'].queryset, attrgetter('engine'))) if x is not None]
+        modellist.sort(key=lambda y: y[0])
+        modelset = self.fields['model']
+        modelset.field.widget.choices = modellist
+        return self.fields
 
     def process(self):
         model = super().process()
