@@ -16,7 +16,7 @@ from django.core.validators import (
     MinValueValidator,
 )
 from django.db.models import Q
-from django.forms.models import BaseInlineFormSet, inlineformset_factory
+from django.forms.models import BaseInlineFormSet, inlineformset_factory, ModelChoiceIterator, ModelChoiceField
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from kraken.kraken import SEGMENTATION_DEFAULT_MODEL
@@ -515,7 +515,7 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     name = forms.CharField()
     file = forms.FileField(
         validators=[FileExtensionValidator(
-            allowed_extensions=['calamarimodel', 'mlmodel', 'traineddata'])])
+            allowed_extensions=['mlmodel', 'traineddata'])])
 
     class Meta:
         model = OcrModel
@@ -528,7 +528,7 @@ class ModelUploadForm(BootstrapFormMixin, forms.ModelForm):
     def clean_file(self):
         # Early validation of the model loading
         file_field = self.cleaned_data['file']
-        if file_field.file.name.rsplit('.', 1)[-1] in ['traineddata', 'calamarimodel']:
+        if file_field.file.name.rsplit('.', 1)[-1] in ['traineddata']:
             self._model_job = 'recognition'
             self.model_metadata = None
             return file_field
