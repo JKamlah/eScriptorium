@@ -1381,11 +1381,11 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
         self.recalculate_ordering(read_direction=read_direction)
 
     def transcribe(self, model, transcription, text_direction=None, user=None):
-        model_ = kraken_models.load_any(model.file.path)
-        #trans, created = Transcription.objects.get_or_create(
+        # if model.engine == "kraken":
+        #    model_ = kraken_models.load_any(model.file.path)
+        # trans, created = Transcription.objects.get_or_create(
         #    name=f"{model.engine}:{model.name}", document=self.document
-        #)
-
+        # )
         lines = self.lines.all()
         text_direction = (
             text_direction
@@ -1401,13 +1401,13 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
             reorder = 'L'
 
         {"kraken": self.transcribe_kraken,
-         "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, trans, text_direction, reorder)
+         "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, transcription, text_direction, reorder)
 
         self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
         self.calculate_progress()
         self.save()
 
-    def transcribe_kraken(self, model, lines, trans, text_direction, reorder):
+    def transcribe_kraken(self, model, lines, transcription, text_direction, reorder):
         model_ = kraken_models.load_any(model.file.path)
         with Image.open(self.image.file.name) as im:
             line_confidences = []
@@ -2088,7 +2088,8 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
 
     def clone_for_training(self, owner, name=None):
         children_count = OcrModel.objects.filter(parent=self).count() + 2
-        name = name or self.name.split(".mlmodel")[0] + f"_v{children_count}"
+        model_extension = self.file.name.rsplit('.', 1)[-1]
+        name = name or self.name.split(model_extension)[0] + f"_v{children_count}"
         model = OcrModel.objects.create(
             owner=self.owner or owner,
             name=name or self.name.split(".")[0] + f"_v{children_count}",
@@ -2099,7 +2100,7 @@ class OcrModel(ExportModelOperationsMixin("OcrModel"), Versioned, models.Model):
             versions=[],
             file_size=self.file.size,
         )
-        model.file = File(self.file, name=f'{name}.mlmodel')
+        model.file = File(self.file, name=f'{name}.{model_extension}')
         model.save()
 
         # if not model.public:

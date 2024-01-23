@@ -800,7 +800,7 @@ class TranscribeForm(BootstrapFormMixin, DocumentProcessFormBase):
 
         if transcription is None:
             # create a new one
-            trans_name = "kraken:" + model.name
+            trans_name = f"{model.engine}: {model.name}"
             # if a transcription with this name already exists we add the date to the name
             if Transcription.objects.filter(
                     name=trans_name,

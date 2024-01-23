@@ -5,8 +5,7 @@ from pathlib import Path
 import shutil
 from dataclasses import dataclass
 from itertools import groupby
-import sys
-from typing import Optional, List, Generator, Type
+from typing import Optional
 
 import numpy as np
 from celery import shared_task
@@ -552,6 +551,7 @@ class CroppingSettings:
     scale_factor: tuple = (1.025, 1.005)
     background: str = 'dominant'
     colorspace: str = 'L'
+
 @dataclass(frozen=True)
 class ExpertSettings:
     cropping: Optional[CroppingSettings] = None  # field(default_factory=CroppingSettings)
@@ -601,6 +601,7 @@ def train_tesseract(qs, document, transcription, model=None, user=None, expert_s
     # Currently just checking if the model is trainable (best model)
     # TODO: Convert model from fast to best instead and than train with that
     if model.file.path:
+        print(shlex.split(f"combine_tessdata -l {model.file.file.name}"))
         model_info = subprocess.check_output(shlex.split(f"combine_tessdata -l {model.file.file.name}"),
                                              stderr=subprocess.STDOUT)
         if b'int_mode=1' in model_info:
@@ -1095,6 +1096,7 @@ def transcribe(instance_pk=None, model_pk=None, user_pk=None,
         user = None
 
     try:
+
         OcrModel = apps.get_model('core', 'OcrModel')
         model = OcrModel.objects.get(pk=model_pk)
         Transcription = apps.get_model('core', 'Transcription')
