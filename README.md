@@ -2,7 +2,7 @@
 There are currently some significant changes to eScriptorium planned. We have decided to delay adapting our Tesseract integration until after the completion of these major changes. Although we have a functional version for both transcription and training with Tesseract in eScriptorium, it still requires further refinement and we wouldn't recommend to use it in the current state for training (it only runs in synchronous way for now). Therefore, we would advise waiting until we have refined our implementation to a point where it is ready for widespread use. We plan to start the rework in summer this year.
 
 We will keep you up to date with the rework process. 
-In the meantime, please feel free to try our current implementation or take a closer look at your tool for PAGE XML data: https://github.com/JKamlah/PagePlus.
+In the meantime, please feel free to try our current implementation or take a closer look at your tool for PAGE XML data: https://github.com/UB-Mannheim/PagePlus.
 
 # eScriptorium
 eScriptorium is part of the [Scripta](https://www.psl.eu/en/scripta), [RESILIENCE](https://www.resilience-ri.eu) and [Biblissima+](https://projet.biblissima.fr/) projects, and has received funding from Université PSL and from The European Union's [Horizon 2020 Research and Innovation Programme](https://ec.europa.eu/programmes/horizon2020/en/what-horizon-2020) under Grant Agreement no. 871127, from the Programme d'investissements d'avenir of the [Agence Nationale de Recheche](https://anr.fr/fr/france-2030/france-2030/) under Grant Reference no. ANR-21-ESRE-0005, as well as from other contributors listed below. Its goal is provide researchers in the humanities with an integrated set of tools to transcribe, annotate, translate and publish historical documents.
