@@ -537,6 +537,8 @@ def crop_image(image, mask, settings=None):
         mask_img = Image.new("L", cutout.size, 255)
         # Mask text region
         draw = ImageDraw.Draw(mask_img)
+        if not isinstance(mask_polygon, Polygon):
+            mask_polygon = mask_polygon.convex_hull
         draw.polygon([(point[0] - bbox[0], point[1] - bbox[1]) for point in list(mask_polygon.exterior.coords)], 0, 1)
         if settings.smooth > 0:
             mask_img = mask_img.filter(ImageFilter.GaussianBlur(settings.smooth))
