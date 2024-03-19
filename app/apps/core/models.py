@@ -1401,13 +1401,13 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
             reorder = 'L'
 
         {"kraken": self.transcribe_kraken,
-         "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, transcription, text_direction, reorder)
+         "tesseract": self.transcribe_tesseract}.get(model.engine, self.transcribe_kraken)(model, lines, transcription, text_direction, reorder, user)
 
         self.workflow_state = self.WORKFLOW_STATE_TRANSCRIBING
         self.calculate_progress()
         self.save()
 
-    def transcribe_kraken(self, model, lines, transcription, text_direction, reorder):
+    def transcribe_kraken(self, model, lines, transcription, text_direction, reorder,  user=None):
         model_ = kraken_models.load_any(model.file.path)
         with Image.open(self.image.file.name) as im:
             line_confidences = []
@@ -1492,7 +1492,7 @@ class DocumentPart(ExportModelOperationsMixin("DocumentPart"), OrderedModel):
             transcription.avg_confidence = avg_line_confidence
             transcription.save()
 
-    def transcribe_tesseract(self, model, lines, trans, text_direction, reorder, expert_settings=None):
+    def transcribe_tesseract(self, model, lines, trans, text_direction, reorder, user=None, expert_settings=None):
         from tesserocr import PyTessBaseAPI, RIL, iterate_level
 
         expert_settings = ExpertSettings() if expert_settings is None else expert_settings
